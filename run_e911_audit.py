@@ -103,7 +103,7 @@ def getEmergencyCID():
     cmd = asteriskBIN + ' -rx "database show"'
     output = os.popen(cmd).read()
     # There's a lot of output here, we need to find lines like:
-    # /DEVICE/814/emergency_cid                         : 7136523145    
+    # /DEVICE/814/emergency_cid                         : 713652565    
     # Then we need to map the extension to the emergency CID in the ipDict dict
 
     # Loop through the output and get the extension number and emergency CID
