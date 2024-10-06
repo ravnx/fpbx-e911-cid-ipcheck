@@ -83,7 +83,6 @@ def getPJSIPExtensions():
             # get the IP address
             ip = match.group(2)
 
-            
             # go to the next if the IP is not an IP address
             if not ip.count('.') == 3:
                 continue
@@ -106,7 +105,6 @@ def getEmergencyCID():
     # There's a lot of output here, we need to find lines like:
     # /DEVICE/814/emergency_cid                         : 7136523145    
     # Then we need to map the extension to the emergency CID in the ipDict dict
-    # if the extension is not in the dict, ignore it, cuz its not online.
 
     # Loop through the output and get the extension number and emergency CID
     for line in output.split('\n'):
@@ -123,7 +121,7 @@ def getEmergencyCID():
             edict[ext] = cid
 
     return edict
-            
+
 
 # Run the functions to get the SIP and PJSIP extensions into the Dict
 getSIPExtensions()
