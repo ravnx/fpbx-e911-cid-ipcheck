@@ -11,7 +11,9 @@ extensions are missing caller IDs. We're only pulling online extensions, since i
 are at if they're offline.
 
 ## Requirements
-Python3
-
+- Python3
+- Asterisk and Freepbx (Might work with other clones)
+- emergency_cid field, must be 10 digits, no < or >.
+  
 ## Configure
 You may need to change your asterisk location, or if you find a bug in the regex that i missed, you might have to fix it.
