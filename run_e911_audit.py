@@ -1,17 +1,13 @@
-import sys
-import os
-import re
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-e911_audit.py
+run_e911_audit.py
 
 Description: This script will connect to asterisk DB and pull all extensions connected IP address, and
-its emergency CID. Generate a report of all extensions in each location, sorted by IP address. We want to 
-know if any IP addresses are grouped together, but have different emergency CIDs (they should be the same 
+its emergency CID. Generate a report of all extensions in each location, sorted by IP address. We want to
+know if any IP addresses are grouped together, but have different emergency CIDs (they should be the same
 since theyre in the same location.) This should tell us phones that are in the same location but have different
-caller IDs, or phones that are in different locations but have the same caller ID. Also should show us what 
+caller IDs, or phones that are in different locations but have the same caller ID. Also should show us what
 extensions are missing caller IDs. We're only pulling online extensions, since its a hassle to tell where they
 are at if they're offline.
 
@@ -19,128 +15,229 @@ Author: Michael Palmer
 Date: 2024-10-06
 """
 
+import ipaddress
+import re
+import subprocess
+import sys
+
 # We're gonna do it dirty right now from the console, later, we'll connect to the DB, or AGI or AMI or something
 # We need to support both SIP and PJSIP extension which use different commands.
 
 # asterisk binary
 asteriskBIN = '/usr/sbin/asterisk'
 
-ipDict = {}
+# Strings asterisk prints on stdout with a zero exit status, which would
+# otherwise look like "no extensions found" instead of "the command failed".
+CLI_ERROR_MARKERS = (
+    'Unable to connect to remote asterisk',
+    'No such command',
+    'Command not found',
+)
 
-# Get SIP extensions only, this is a different command and a different parse than PJSIP.
-def getSIPExtensions():
-    # asterisk command to get external IPs of registered extensions
-    cmd = asteriskBIN + ' -rx "sip show peers" '
-    # output is like this:
-    #122/122                   127.12.17.90                           D  Yes        Yes         A  11889    OK (34 ms)                                   
-    #124/124                   219.33.50.50                             D  Yes        Yes         A  13479    OK (31 ms)                                   
 
-    # get the output of the command
-    output = os.popen(cmd).read()
+def is_cli_failure(returncode, output):
+    """True if an asterisk -rx invocation did not actually produce a result.
 
-    # loop through the output and get the IP and extension number
+    asterisk exits 0 even when the command is unknown or the daemon is
+    unreachable, so the output has to be sniffed as well. An empty result is
+    also treated as failure: every command here should print at least a header.
+    """
+    if returncode != 0:
+        return True
+    if not output.strip():
+        return True
+    return any(marker in output for marker in CLI_ERROR_MARKERS)
+
+
+def run_asterisk_cmd(command):
+    """Run `asterisk -rx <command>`. Returns (ok, output)."""
+    try:
+        proc = subprocess.run(
+            [asteriskBIN, '-rx', command],
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        return False, f'{asteriskBIN}: {exc}'
+
+    output = proc.stdout + proc.stderr
+    return not is_cli_failure(proc.returncode, output), output
+
+
+def is_valid_ip(ip):
+    """True for a real dotted-quad. Keeps junk out so the numeric sort is safe."""
+    try:
+        ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return True
+
+
+def parse_sip_peers(output):
+    """Parse `sip show peers` into a list of (ext, ip) for ONLINE peers only.
+
+    Output is column-padded and looks like this:
+    122/122         127.12.17.90    D  Yes  Yes  A  11889  OK (34 ms)
+    130/130         10.0.0.55       D  Yes  Yes  A  5060   UNREACHABLE
+    """
+    peers = []
     for line in output.split('\n'):
-        if len(line) > 0:
-            # split the line by spaces
-            parts = line.split()
-            # get the extension number
-            ext = parts[0].split('/')[0]
-            # go to the next if the ext is not numberic
-            if not ext.isnumeric():
-                continue
-            # get the IP address
-            ip = parts[1]
-            # go to the next if the IP is not an IP address
-            if not ip.count('.') == 3:
-                continue
+        # Padding means "not empty" is not the same as "has content".
+        if not line.strip():
+            continue
 
-            # add the IP and extension to a dictionary
-            # if the IP is not in the dictionary, add the IP as the key and the extension as the value
-            if ip in ipDict:
-                ipDict[ip][ext] = None
-            else:
-                ipDict[ip] = {ext: None}
+        # Only peers asterisk can currently reach are in a known location.
+        # UNREACHABLE/UNKNOWN/Unmonitored peers still print a last-known host,
+        # which is exactly how a relocated phone gets filed under its old site.
+        if 'OK (' not in line:
+            continue
 
-# Get PJSIP extensions now
-def getPJSIPExtensions():
-    cmd = asteriskBIN + ' -rx "PJSIP show contacts"'
-    # output is like this:
-    # Contact:  115/sip:115@127.153.63.153:5887;x-ast-orig-host= 47e23d99a7 Avail        62.119
-    # Contact:  120/sip:120@234.151.131.15:5555;x-ast-orig-hos 000b045248 Avail       143.726
+        parts = line.split()
+        if len(parts) < 2:
+            continue
 
-    # get the output of the command
-    output = os.popen(cmd).read()
+        ext = parts[0].split('/')[0]
+        if not ext.isnumeric():
+            continue
 
-    # loop through the output and get the IP and extension number
+        ip = parts[1]
+        if not is_valid_ip(ip):
+            continue
+
+        peers.append((ext, ip))
+    return peers
+
+
+def parse_pjsip_contacts(output):
+    """Parse `pjsip show contacts` into a list of (ext, ip) for Avail contacts.
+
+    Output looks like this:
+    Contact:  115/sip:115@127.153.63.153:5887;x-ast-orig-host= 47e23d99a7 Avail  62.119
+    Contact:  120/sip:mac001565abcdef@234.151.131.15:5555;x-a 000b045248 Avail  143.726
+
+    The extension is the AOR before the slash, NOT the user part of the
+    contact URI -- Yealinks register using the device MAC.
+    """
+    contacts = []
     for line in output.split('\n'):
-        if len(line) > 0:
-            # use a regex to match the extension number and IP address
-            match = re.search(r'Contact:\s+\d+/sip[s]?:(\d+)@(\d+\.\d+\.\d+\.\d+)', line)
-            if not match:
-                continue
-            # get the extension number
-            ext = match.group(1)
-            # get the IP address
-            ip = match.group(2)
+        if not line.strip():
+            continue
 
-            # go to the next if the IP is not an IP address
-            if not ip.count('.') == 3:
-                continue
+        # Status is Avail / Unavail / Unknown / NonQual. \b keeps "Unavail"
+        # from matching, since its 'a' is lowercase.
+        if not re.search(r'\bAvail\b', line):
+            continue
 
-            # add the IP and extension to a dictionary
-            # if the IP is not in the dictionary, add the IP as the key and the extension as the value
-            if ip in ipDict:
-                ipDict[ip][ext] = None
-            else:
-                ipDict[ip] = {ext: None}
+        match = re.search(
+            r'Contact:\s+(\d+)/sips?:[^@]+@(\d+\.\d+\.\d+\.\d+)',
+            line,
+        )
+        if not match:
+            continue
 
-# Get Emergency CID from asterisk in memory database, no need to connect to the DB.
-def getEmergencyCID():
-    # Lets pull a dict of extensions and their emergency CID
-    # Later we can merge it with ipDict
-    edict = {}
-    # get the emergency CID for the extension
-    cmd = asteriskBIN + ' -rx "database show"'
-    output = os.popen(cmd).read()
-    # There's a lot of output here, we need to find lines like:
-    # /DEVICE/814/emergency_cid                         : 713652565    
-    # Then we need to map the extension to the emergency CID in the ipDict dict
+        ext = match.group(1)
+        ip = match.group(2)
+        if not is_valid_ip(ip):
+            continue
 
-    # Loop through the output and get the extension number and emergency CID
+        contacts.append((ext, ip))
+    return contacts
+
+
+def parse_emergency_cids(output):
+    """Parse `database show` into {ext: cid}.
+
+    Lines look like:
+    /DEVICE/814/emergency_cid       : 713652565
+
+    FreePBX also stores <7135551212> and +17135551212, so the value is taken
+    whole and reduced to digits. Matching only bare digits would drop those
+    rows and report the extension as having no emergency CID at all.
+    """
+    cids = {}
     for line in output.split('\n'):
-        if len(line) > 0:
-            # use a regex to match the extension number and IP address
-            match = re.search(r'/DEVICE/(\d+)/emergency_cid\s+:\s+(\d+)', line)
-            if not match:
-                continue
-            # get the extension number
-            ext = match.group(1)
-            # get the emergency CID
-            cid = match.group(2)
-            # add the emergency CID to the dictionary
-            edict[ext] = cid
+        if not line.strip():
+            continue
 
-    return edict
+        match = re.search(r'/DEVICE/(\d+)/emergency_cid\s*:\s*(.*)$', line)
+        if not match:
+            continue
+
+        ext = match.group(1)
+        cid = re.sub(r'\D', '', match.group(2))
+        if not cid:
+            continue
+
+        cids[ext] = cid
+    return cids
 
 
-# Run the functions to get the SIP and PJSIP extensions into the Dict
-getSIPExtensions()
-getPJSIPExtensions()
-eDict = getEmergencyCID()
+def sort_ips(ips):
+    """Numeric sort, so hosts on a subnet stay adjacent in the report."""
+    return sorted(ips, key=ipaddress.ip_address)
 
-# Now we need to merge the two dicts so that the extension key is updated with the emergency CID value
-for ip in ipDict:
-    for ext in ipDict[ip]:
-        if ext in eDict:
-            ipDict[ip][ext] = eDict[ext]
 
-# sort the IP addresses
-sortedIP = sorted(ipDict.keys())
+def sort_extensions(exts):
+    return sorted(exts, key=int)
 
-# print the report
-for ip in sortedIP:
-    print(ip)
-    for ext in sorted(ipDict[ip].keys()):
-        print(f'    {ext} - {ipDict[ip][ext]}')
-    print()
 
+def main():
+    ipDict = {}
+
+    # chan_sip is gone on Asterisk 18+/FreePBX 16+, so a SIP failure alone is
+    # not fatal -- but losing both collectors means there is no report to make.
+    sipOK, sipOutput = run_asterisk_cmd('sip show peers')
+    if not sipOK:
+        print(f'WARNING: "sip show peers" failed, skipping SIP peers:\n{sipOutput.strip()}',
+              file=sys.stderr)
+
+    pjsipOK, pjsipOutput = run_asterisk_cmd('pjsip show contacts')
+    if not pjsipOK:
+        print(f'WARNING: "pjsip show contacts" failed, skipping PJSIP contacts:\n{pjsipOutput.strip()}',
+              file=sys.stderr)
+
+    if not sipOK and not pjsipOK:
+        print('ERROR: could not collect extensions from either SIP or PJSIP. Aborting.',
+              file=sys.stderr)
+        return 1
+
+    pairs = []
+    if sipOK:
+        pairs += parse_sip_peers(sipOutput)
+    if pjsipOK:
+        pairs += parse_pjsip_contacts(pjsipOutput)
+
+    for ext, ip in pairs:
+        ipDict.setdefault(ip, {})[ext] = None
+
+    # A failed database show would render every extension as "missing CID",
+    # which is the exact false alarm this audit exists to catch. Never guess.
+    dbOK, dbOutput = run_asterisk_cmd('database show')
+    if not dbOK:
+        print(f'ERROR: "database show" failed, cannot read emergency CIDs. Aborting:\n{dbOutput.strip()}',
+              file=sys.stderr)
+        return 1
+    eDict = parse_emergency_cids(dbOutput)
+
+    # Now we need to merge the two dicts so that the extension key is updated with the emergency CID value
+    for ip in ipDict:
+        for ext in ipDict[ip]:
+            if ext in eDict:
+                ipDict[ip][ext] = eDict[ext]
+
+    if not ipDict:
+        print('No online extensions found.', file=sys.stderr)
+        return 0
+
+    # print the report
+    for ip in sort_ips(ipDict.keys()):
+        print(ip)
+        for ext in sort_extensions(ipDict[ip].keys()):
+            print(f'    {ext} - {ipDict[ip][ext]}')
+        print()
+
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

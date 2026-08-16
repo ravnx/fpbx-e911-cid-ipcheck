@@ -13,7 +13,12 @@ are at if they're offline.
 ## Requirements
 - Python3
 - Asterisk and Freepbx (Might work with other clones)
-- emergency_cid field, must be 10 digits, no < or >.
+- emergency_cid field. `<7135551212>` and `+17135551212` are both read fine now — the value is reduced to its digits. Note that a `+1` prefix is kept, so `7135551212` and `+17135551212` will still compare as different CIDs.
   
 ## Configure
 You may need to change your asterisk location, or if you find a bug in the regex that i missed, you might have to fix it.
+
+## Tests
+The parsing runs against captured CLI output, so no live Asterisk is needed:
+
+    python3 -m unittest discover -v
