@@ -144,15 +144,34 @@ def parse_pjsip_contacts(output):
     return contacts
 
 
+def normalize_cid(value):
+    """Reduce a stored emergency_cid to one comparable form.
+
+    The same emergency number gets stored several ways:
+        7135551212   17135551212   <7135551212>   <17135551212>   +17135551212
+    All of them are the same number, so all of them must reduce to the same
+    string -- otherwise the report flags mismatches inside a location that
+    are really just formatting differences.
+
+    Punctuation is dropped and a NANP country code is stripped. Values that
+    are not 11 digits starting with 1 are left alone, so anything that isn't
+    a NANP number is not silently mangled.
+    """
+    digits = re.sub(r'\D', '', value)
+    if len(digits) == 11 and digits.startswith('1'):
+        digits = digits[1:]
+    return digits
+
+
 def parse_emergency_cids(output):
-    """Parse `database show` into {ext: cid}.
+    """Parse `database show` into {ext: normalized cid}.
 
     Lines look like:
     /DEVICE/814/emergency_cid       : 713652565
 
-    FreePBX also stores <7135551212> and +17135551212, so the value is taken
-    whole and reduced to digits. Matching only bare digits would drop those
-    rows and report the extension as having no emergency CID at all.
+    The value is taken whole and then normalized. Matching only bare digits
+    would drop the <> and +1 forms entirely and report those extensions as
+    having no emergency CID at all.
     """
     cids = {}
     for line in output.split('\n'):
@@ -164,7 +183,7 @@ def parse_emergency_cids(output):
             continue
 
         ext = match.group(1)
-        cid = re.sub(r'\D', '', match.group(2))
+        cid = normalize_cid(match.group(2))
         if not cid:
             continue
 

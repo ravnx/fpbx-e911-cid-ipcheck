@@ -40,10 +40,15 @@ PJSIP_OUTPUT = (
     "   \n"
 )
 
+# The four forms that actually occur in this FreePBX install, plus the
+# +E.164 variant. All five are the same emergency number and must compare
+# equal, or the report invents mismatches that aren't real.
 DATABASE_OUTPUT = (
-    "/DEVICE/814/emergency_cid                         : 713652565\n"
-    "/DEVICE/815/emergency_cid                         : <7135551212>\n"
-    "/DEVICE/816/emergency_cid                         : +17135551212\n"
+    "/DEVICE/810/emergency_cid                         : 7135551212\n"
+    "/DEVICE/811/emergency_cid                         : 17135551212\n"
+    "/DEVICE/812/emergency_cid                         : <7135551212>\n"
+    "/DEVICE/813/emergency_cid                         : <17135551212>\n"
+    "/DEVICE/814/emergency_cid                         : +17135551212\n"
     "/DEVICE/817/emergency_cid                         :\n"
     "/DEVICE/818/dial                                  : PJSIP/818\n"
     "   \n"
@@ -116,17 +121,46 @@ class TestParsePjsipContacts(unittest.TestCase):
         self.assertEqual(audit.parse_pjsip_contacts("   \n"), [])
 
 
+class TestNormalizeCid(unittest.TestCase):
+    """All the ways one emergency number gets stored must reduce to one value."""
+
+    def test_bare_ten_digit(self):
+        self.assertEqual(audit.normalize_cid("7135551212"), "7135551212")
+
+    def test_leading_country_code(self):
+        self.assertEqual(audit.normalize_cid("17135551212"), "7135551212")
+
+    def test_angle_bracketed(self):
+        self.assertEqual(audit.normalize_cid("<7135551212>"), "7135551212")
+
+    def test_angle_bracketed_with_country_code(self):
+        self.assertEqual(audit.normalize_cid("<17135551212>"), "7135551212")
+
+    def test_e164(self):
+        self.assertEqual(audit.normalize_cid("+17135551212"), "7135551212")
+
+    def test_surrounding_whitespace(self):
+        self.assertEqual(audit.normalize_cid("  <17135551212>  "), "7135551212")
+
+    def test_short_value_left_alone(self):
+        """Not every stored value is a 10/11 digit NANP number; don't mangle it."""
+        self.assertEqual(audit.normalize_cid("713652565"), "713652565")
+
+    def test_eleven_digits_not_starting_with_one_left_alone(self):
+        self.assertEqual(audit.normalize_cid("27135551212"), "27135551212")
+
+    def test_empty(self):
+        self.assertEqual(audit.normalize_cid("<>"), "")
+
+
 class TestParseEmergencyCids(unittest.TestCase):
 
-    def test_plain_digits(self):
-        self.assertEqual(audit.parse_emergency_cids(DATABASE_OUTPUT)["814"], "713652565")
-
-    def test_angle_bracketed_value(self):
-        """Finding 3: <7135551212> silently read as a missing CID."""
-        self.assertEqual(audit.parse_emergency_cids(DATABASE_OUTPUT)["815"], "7135551212")
-
-    def test_e164_value(self):
-        self.assertEqual(audit.parse_emergency_cids(DATABASE_OUTPUT)["816"], "17135551212")
+    def test_all_stored_forms_compare_equal(self):
+        cids = audit.parse_emergency_cids(DATABASE_OUTPUT)
+        self.assertEqual(
+            [cids["810"], cids["811"], cids["812"], cids["813"], cids["814"]],
+            ["7135551212"] * 5,
+        )
 
     def test_genuinely_empty_value_is_absent(self):
         self.assertNotIn("817", audit.parse_emergency_cids(DATABASE_OUTPUT))
